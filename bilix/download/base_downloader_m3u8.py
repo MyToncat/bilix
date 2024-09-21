@@ -1,35 +1,48 @@
 import asyncio
-import re
-from typing import Union
+import uuid
+from pathlib import Path, PurePath
+from typing import Tuple, Union
+from urllib.parse import urlparse
 import aiofiles
 import httpx
 import os
 import m3u8
 from Crypto.Cipher import AES
 from m3u8 import Segment
-
-from bilix.handle import Handler, HandleMethodError
 from bilix.download.base_downloader import BaseDownloader
-from bilix.log import logger
-from bilix.utils import req_retry, merge_files
+from bilix.download.utils import path_check, merge_files
+from bilix import ffmpeg
+from .utils import req_retry
+
+__all__ = ['BaseDownloaderM3u8']
 
 
 class BaseDownloaderM3u8(BaseDownloader):
-    def __init__(self, client: httpx.AsyncClient, videos_dir="videos", video_concurrency=3, part_concurrency=10,
-                 speed_limit: Union[float, int] = None, progress=None):
-        """
-        Base async m3u8 Downloader
+    """Base Async http m3u8 Downloader"""
 
-        :param client:
-        :param videos_dir:
-        :param video_concurrency:
-        :param part_concurrency:
-        :param speed_limit:
-        :param progress:
-        """
-        super(BaseDownloaderM3u8, self).__init__(client, videos_dir, speed_limit=speed_limit, progress=progress)
-        self.v_sema = asyncio.Semaphore(video_concurrency)
-        self.part_con = part_concurrency
+    def __init__(
+            self,
+            *,
+            client: httpx.AsyncClient = None,
+            browser: str = None,
+            speed_limit: Union[float, int] = None,
+            stream_retry: int = 5,
+            progress=None,
+            logger=None,
+            # unique params
+            part_concurrency: int = 10,
+            video_concurrency: Union[int, asyncio.Semaphore] = 3,
+    ):
+        super(BaseDownloaderM3u8, self).__init__(
+            client=client,
+            browser=browser,
+            stream_retry=stream_retry,
+            speed_limit=speed_limit,
+            progress=progress,
+            logger=logger
+        )
+        self.v_sema = asyncio.Semaphore(video_concurrency) if isinstance(video_concurrency, int) else video_concurrency
+        self.part_concurrency = part_concurrency
         self.decrypt_cache = {}
 
     async def _decrypt(self, seg: m3u8.Segment, content: bytearray):
@@ -48,124 +61,135 @@ class BaseDownloaderM3u8(BaseDownloader):
         cipher = self.decrypt_cache[uri]
         return cipher.decrypt(content)
 
-    async def get_m3u8_video(self, m3u8_url: str, name: str, hierarchy: str = '', retry: int = 5) -> str:
-        """
-        download
-
-        :param m3u8_url:
-        :param name:
-        :param hierarchy:
-        :param retry:
-        :return: downloaded file path
-        """
-        base_path = f"{self.videos_dir}/{hierarchy}" if hierarchy else self.videos_dir
-        file_path = f"{base_path}/{name}.ts"
-        if os.path.exists(file_path):
-            logger.info(f"[green]已存在[/green] {name}.ts")
-            return file_path
-        await self.v_sema.acquire()
-        res = await req_retry(self.client, m3u8_url)
+    async def to_invariant_m3u8(self, m3u8_url: str) -> m3u8.M3U8:
+        res = await req_retry(self.client, m3u8_url, follow_redirects=True)
         m3u8_info = m3u8.loads(res.text)
         if not m3u8_info.base_uri:
-            base_uri = re.search(r"(.*)/[^/]*m3u8", m3u8_url).groups()[0]
-            m3u8_info.base_uri = base_uri
-        cors = []
-        p_sema = asyncio.Semaphore(self.part_con)
-        task_id = await self.progress.add_task(  # invisible at first and create task id for _get_ts
-            description=name if len(name) < 33 else f'{name[:15]}...{name[-15:]}', visible=False)
-        total_time = 0
-        for idx, seg in enumerate(m3u8_info.segments):
-            total_time += seg.duration
-            # https://stackoverflow.com/questions/50628791/decrypt-m3u8-playlist-encrypted-with-aes-128-without-iv
-            if seg.key and seg.key.iv is None:
-                seg.custom_parser_values['iv'] = idx.to_bytes(16, 'big')
-            cors.append(self._get_ts(seg, f"{name}-{idx}.ts", task_id, p_sema, hierarchy, retry=retry))
-        await self.progress.update(task_id, total=0, total_time=total_time)
-        file_list = await asyncio.gather(*cors)
-        self.v_sema.release()
-        await merge_files(file_list, new_name=file_path)
-        logger.info(f"[cyan]已完成[/cyan] {name}.ts")
+            m3u8_info.base_uri = m3u8_url
+        if m3u8_info.is_variant:
+            self.logger.debug(f"m3u8 is variant, use first playlist: {m3u8_info.playlists[0].absolute_uri}")
+            return await self.to_invariant_m3u8(m3u8_info.playlists[0].absolute_uri)
+        return m3u8_info
+
+    async def get_m3u8_video(self, m3u8_url: str, path: Union[str, Path], time_range: Tuple[int, int] = None) -> Path:
+        """
+        download video from m3u8 url
+        :cli: short: m3u8
+        :param m3u8_url:
+        :param path: file path or file dir, if dir, filename will be set according to m3u8_url
+        :param time_range: (start, end) in seconds, if provided, only download the clip and add start-end to filename
+        :return: downloaded file path
+        """
+        if path.is_dir():
+            path = (path / PurePath(urlparse(m3u8_url).path).stem).with_suffix('.mp4')
+        if time_range:
+            path = path.with_stem(f"{path.stem}-{time_range[0]}-{time_range[1]}")
+        exist, path = path_check(path)
+        if exist:
+            self.logger.info(f"[green]已存在[/green] {path.name}")
+            return path
+        async with self.v_sema:
+            task_id = await self.progress.add_task(total=None, description=path.name)
+            m3u8_info = await self.to_invariant_m3u8(m3u8_url)
+            cors = []
+            p_sema = asyncio.Semaphore(self.part_concurrency)
+            total_time = 0
+            if time_range:
+                current_time = 0
+                start_time, end_time = time_range
+                inside = False
+            else:
+                inside = True
+            for idx, seg in enumerate(m3u8_info.segments):
+                if time_range:
+                    current_time += seg.duration
+                    if not inside and current_time > start_time:
+                        inside = True
+                        s = seg.duration - (current_time - start_time)
+                    elif current_time > end_time:
+                        break
+                if inside:
+                    total_time += seg.duration
+                    # https://stackoverflow.com/questions/50628791/decrypt-m3u8-playlist-encrypted-with-aes-128-without-iv
+                    if seg.key and seg.key.iv is None:
+                        seg.custom_parser_values['iv'] = idx.to_bytes(16, 'big')
+                    cors.append(self._get_seg(seg, path.with_name(f"{path.stem}-{idx}.ts"), task_id, p_sema))
+            if len(cors) == 0 and time_range:
+                raise Exception(f"time range <{start_time}-{end_time}> invalid for <{path.name}>")
+            if init_sec := m3u8_info.segments[0].init_section:
+                async def _get_init():
+                    r = await req_retry(self.client, init_sec.absolute_uri)
+                    async with aiofiles.open(fn := path.with_name(f"{path.stem}-init"), 'wb') as f:
+                        await f.write(r.content)
+                        return fn
+
+                cors.insert(0, _get_init())
+                merge_fn = merge_files
+            else:
+                merge_fn = ffmpeg.concat
+            await self.progress.update(task_id, total_time=total_time)
+            file_list = await asyncio.gather(*cors)
+
+        await merge_fn(file_list, path)
+        if time_range:
+            path_tmp = path.with_stem(str(uuid.uuid4()))
+            # to save key frame, use 0 as start time instead of s, clip will be a little longer than expected
+            await ffmpeg.time_range_clip(path, 0, end_time - start_time + s, path_tmp)
+            os.rename(path_tmp, path)
+        self.logger.info(f"[cyan]已完成[/cyan] {path.name}")
         await self.progress.update(task_id, visible=False)
-        return file_path
+        return path
 
     async def _update_task_total(self, task_id, time_part: float, update_size: int):
         task = self.progress.tasks[task_id]
-        if not self.progress.tasks[task_id].visible:
+        if task.total is None:
             confirmed_t = time_part
             confirmed_b = update_size
-            await self.progress.update(task_id, visible=True)
         else:
             confirmed_t = time_part + task.fields['confirmed_t']
             confirmed_b = update_size + task.fields['confirmed_b']
-        predicted_total = confirmed_b / confirmed_t * task.fields['total_time']
+        predicted_total = task.fields['total_time'] * confirmed_b / confirmed_t
         await self.progress.update(task_id, total=predicted_total, confirmed_t=confirmed_t, confirmed_b=confirmed_b)
 
-    async def _get_ts(self, seg: Segment, name, task_id, p_sema: asyncio.Semaphore, hierarchy: str = '',
-                      retry: int = 5) -> str:
-        ts_url = seg.absolute_uri
-        base_path = f"{self.videos_dir}/{hierarchy}" if hierarchy else self.videos_dir
-        file_path = f"{base_path}/{name}"
-        if os.path.exists(file_path):
-            downloaded = os.path.getsize(file_path)
+    async def _get_seg(self, seg: Segment, path: Path, task_id, p_sema: asyncio.Semaphore) -> Path:
+        exists, path = path_check(path)
+        if exists:
+            downloaded = os.path.getsize(path)
             await self._update_task_total(task_id, time_part=seg.duration, update_size=downloaded)
             await self.progress.update(task_id, advance=downloaded)
-            return file_path
-
+            return path
+        seg_url = seg.absolute_uri
         async with p_sema:
             content = None
-            for exception in range(1 + retry):
+            for times in range(1 + self.stream_retry):
+                content = bytearray()
                 try:
-                    content = bytearray()
-                    async with self.client.stream("GET", ts_url) as r:
+                    async with self.client.stream("GET", seg_url,
+                                                  follow_redirects=True) as r, self._stream_context(times):
                         r.raise_for_status()
-                        await self._update_task_total(
-                            task_id, time_part=seg.duration, update_size=int(r.headers['content-length']))
-                        async for chunk in r.aiter_bytes():
+                        # pre-update total if content-length is provided and first time to get content
+                        if 'content-length' in r.headers and not content:
+                            await self._update_task_total(
+                                task_id, time_part=seg.duration, update_size=int(r.headers['content-length']))
+                        async for chunk in r.aiter_bytes(chunk_size=self.chunk_size):
                             content.extend(chunk)
                             await self.progress.update(task_id, advance=len(chunk))
-                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
-                    if exception > retry - 2:
-                        logger.warning(
-                            f'STREAM {e.__class__.__name__} 异常可能由于网络条件不佳或并发数过大导致，若重复出现请考虑降低并发数')
-                    await asyncio.sleep(.1 * exception)
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 403:
-                        logger.warning(f"STREAM slowing down since 403 forbidden {ts_url}")
-                        await asyncio.sleep(10. * (exception + 1))
-                    else:
-                        logger.warning(f"STREAM {e}")
-                        await asyncio.sleep(.5 * exception)
-                except Exception as e:
-                    if exception > 1:
-                        logger.warning(f'STREAM {e.__class__.__name__} 未知异常')
-                    await asyncio.sleep(.5 * exception)
-                else:
+                            await self._check_speed(len(chunk))
+                    if 'content-length' not in r.headers:  # after-update total if content-length is not provided
+                        await self._update_task_total(task_id, time_part=seg.duration, update_size=len(content))
                     break
+                except (httpx.HTTPStatusError, httpx.TransportError):
+                    continue
             else:
-                logger.error(f"STREAM 超过重复次数 {ts_url}")
-                raise Exception(f"STREAM 超过重复次数 {ts_url}")
-        # in case .png
-        if re.fullmatch(r'.*\.png', ts_url):
-            _, _, content = content.partition(b'\x47\x40')
+                raise Exception(f"STREAM 超过重复次数 {seg_url}")
+        content = self._after_seg(seg, content)
         # in case encrypted
         if seg.key:
             content = await self._decrypt(seg, content)
-        async with aiofiles.open(file_path, 'wb') as f:
+        async with aiofiles.open(path, 'wb') as f:
             await f.write(content)
-        return file_path
+        return path
 
-
-@Handler(name="m3u8")
-def handle(**kwargs):
-    key = kwargs['key']
-    if re.fullmatch(r"http.+m3u8(\?.*)?", key):
-        videos_dir = kwargs['videos_dir']
-        part_concurrency = kwargs['part_concurrency']
-        speed_limit = kwargs['speed_limit']
-        method = kwargs['method']
-        d = BaseDownloaderM3u8(httpx.AsyncClient(), videos_dir=videos_dir, part_concurrency=part_concurrency,
-                               speed_limit=speed_limit)
-        if method == 'get_video' or method == 'v':
-            cor = d.get_m3u8_video(key, "unnamed")
-            return d, cor
-        raise HandleMethodError(d, method)
+    def _after_seg(self, seg: Segment, content: bytearray) -> bytearray:
+        """hook for subclass to modify segment content, happened before decrypt"""
+        return content
